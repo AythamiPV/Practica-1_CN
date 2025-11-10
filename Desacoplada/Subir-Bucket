@@ -1,0 +1,5 @@
+aws s3 mb s3://aythami23-lambda-layers --region us-east-1     -----> Lo crea (nombre único universal).
+
+aws s3 cp lambda_package.zip s3://aythami23-lambda-layers/    -----> Sube el .zip al bucket.
+
+aws s3 ls s3://aythami23-lambda-layers/                       -----> Verificar que se ha subido correctamente.
