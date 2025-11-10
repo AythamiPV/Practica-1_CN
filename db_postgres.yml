@@ -1,0 +1,82 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "RDS PostgreSQL para Fishing Store App"
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde desplegar la DB
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets privadas (mínimo 2)
+
+  DBName:
+    Type: String
+    Default: fishingdb
+    Description: Nombre de la base de datos
+
+  DBUser:
+    Type: String
+    Default: postgres
+    Description: Usuario maestro
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: Contraseña del usuario maestro
+
+Resources:
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Seguridad para PostgreSQL Fishing Store
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: fishing-db-subnet-group
+      DBSubnetGroupDescription: Subnet group para Fishing Store PostgreSQL
+      SubnetIds: !Ref SubnetIds
+
+  PostgresDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: fishing-postgres-db
+      Engine: postgres
+      EngineVersion: "17.6"
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: true
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+
+Outputs:
+  DBEndpoint:
+    Description: Endpoint del PostgreSQL Fishing Store
+    Value: !GetAtt PostgresDBInstance.Endpoint.Address
+
+  DBPort:
+    Description: Puerto de la DB
+    Value: !GetAtt PostgresDBInstance.Endpoint.Port
+
+  DBName:
+    Description: Nombre de la DB
+    Value: !Ref DBName
+
+  DBUser:
+    Description: Usuario de la DB
+    Value: !Ref DBUser
