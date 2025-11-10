@@ -1,0 +1,7 @@
+docker build -t fishing-store:latest .                                                                                                                    ---------> Crea la imagen docker en local.
+
+docker tag fishing-store:latest 471112965021.dkr.ecr.us-east-1.amazonaws.com/fishing-store:latest                                                         ---------> Relaccionas tu imagen docket con el ECR.
+
+aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin 471112965021.dkr.ecr.us-east-1.amazonaws.com/fishing-store   ---------> Inicias secion para poder subir tu Docker.
+
+docker push 471112965021.dkr.ecr.us-east-1.amazonaws.com/fishing-store:latest                                                                             ---------> Subes la imagen Docker a ECR.
