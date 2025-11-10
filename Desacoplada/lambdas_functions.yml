@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Lambdas CRUD desacopladas para Fishing Store"
+Description: "Lambdas CRUD desacopladas para Fishing Store en VPC"
 
 Parameters:
   DBHOST:
@@ -15,8 +15,30 @@ Parameters:
     Type: String
     NoEcho: true
     Description: Contraseña de la base de datos
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC donde desplegar las Lambdas
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets privadas para las Lambdas (mínimo 2)
 
 Resources:
+
+  # Security Group para las Lambdas
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group para Lambdas en VPC
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0  # Para conectar a RDS
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0  # Para salida a internet (CloudWatch Logs, etc.)
 
   Pg8000Layer:
     Type: AWS::Lambda::LayerVersion
@@ -31,113 +53,6 @@ Resources:
       LicenseInfo: "MIT"
 
   # =====================
-  # INIT DB LAMBDA
-  # =====================
-  InitDBLambda:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: init-db-lambda
-      Runtime: python3.11
-      Handler: index.handler
-      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
-      Timeout: 300
-      MemorySize: 256
-      Environment:
-        Variables:
-          DB_HOST: !Ref DBHOST
-          DB_NAME: !Ref DBNAME
-          DB_USER: !Ref DBUSER
-          DB_PASS: !Ref DBPASS
-      Layers:
-        - !Ref Pg8000Layer
-      Code:
-        ZipFile: |
-          import json
-          import os
-          import pg8000
-
-          def handler(event, context):
-              print("Iniciando inicialización de la base de datos...")
-              
-              try:
-                  conn = pg8000.connect(
-                      user=os.environ['DB_USER'],
-                      password=os.environ['DB_PASS'],
-                      host=os.environ['DB_HOST'],
-                      database=os.environ['DB_NAME'],
-                      port=5432
-                  )
-                  
-                  cursor = conn.cursor()
-                  
-                  # Script SQL completo
-                  sql_script = """
-                  -- Crear extensión para UUIDs
-                  CREATE EXTENSION IF NOT EXISTS "pgcrypto";
-
-                  -- Crear tabla products
-                  CREATE TABLE IF NOT EXISTS products (
-                      product_id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
-                      name VARCHAR(255) NOT NULL,
-                      price DECIMAL(10,2) DEFAULT 0,
-                      stock INTEGER DEFAULT 0,
-                      description TEXT,
-                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                  );
-
-                  -- Insertar datos de prueba
-                  INSERT INTO products (product_id, name, price, stock, description) VALUES
-                  ('prod-001', 'Caña de Pescar Profesional', 89.99, 15, 'Caña de fibra de carbono de alta resistencia'),
-                  ('prod-002', 'Carrete Spinning', 45.50, 20, 'Carrete de precisión con freno ajustable'),
-                  ('prod-003', 'Señuelos Artificiales', 12.99, 50, 'Pack de 5 señuelos de diferentes colores')
-                  ON CONFLICT (product_id) DO NOTHING;
-
-                  -- Verificar inserción
-                  SELECT COUNT(*) as total_products FROM products;
-                  """
-                  
-                  # Ejecutar script
-                  cursor.execute(sql_script)
-                  result = cursor.fetchone()
-                  
-                  conn.commit()
-                  cursor.close()
-                  conn.close()
-                  
-                  message = f"Base de datos inicializada correctamente. Total productos: {result[0]}"
-                  print(message)
-                  
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({
-                          'message': message,
-                          'products_count': result[0],
-                          'initialized': True
-                      })
-                  }
-                  
-              except Exception as e:
-                  error_msg = f"Error inicializando DB: {str(e)}"
-                  print(error_msg)
-                  return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': error_msg, 'initialized': False})
-                  }
-
-  # =====================
   # CREATE PRODUCT LAMBDA
   # =====================
   CreateProductLambda:
@@ -147,8 +62,12 @@ Resources:
       Runtime: python3.11
       Handler: index.handler
       Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DBHOST
@@ -164,86 +83,177 @@ Resources:
           import pg8000
           from decimal import Decimal
 
+          def init_database():
+            """Inicializa la base de datos si no existe"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              
+              # Script SQL completo
+              sql_script = """
+              -- Crear extensión para UUIDs
+              CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+              -- Crear tabla products
+              CREATE TABLE IF NOT EXISTS products (
+                  product_id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                  name VARCHAR(255) NOT NULL,
+                  price DECIMAL(10,2) DEFAULT 0,
+                  stock INTEGER DEFAULT 0,
+                  description TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+
+              -- Insertar datos de prueba
+              INSERT INTO products (product_id, name, price, stock, description) VALUES
+              ('prod-001', 'Caña de Pescar Profesional', 89.99, 15, 'Caña de fibra de carbono de alta resistencia'),
+              ('prod-002', 'Carrete Spinning', 45.50, 20, 'Carrete de precisión con freno ajustable'),
+              ('prod-003', 'Señuelos Artificiales', 12.99, 50, 'Pack de 5 señuelos de diferentes colores')
+              ON CONFLICT (product_id) DO NOTHING;
+              """
+              
+              cursor.execute(sql_script)
+              conn.commit()
+              cursor.close()
+              conn.close()
+              return True
+              
+            except Exception as e:
+              print(f"Error en inicialización: {str(e)}")
+              return False
+
+          def ensure_table_exists():
+            """Verifica si la tabla existe y la crea si no"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              cursor.execute("""
+                SELECT EXISTS (
+                  SELECT FROM information_schema.tables 
+                  WHERE table_name = 'products'
+                );
+              """)
+              table_exists = cursor.fetchone()[0]
+              cursor.close()
+              conn.close()
+              
+              if not table_exists:
+                print("Tabla no existe. Inicializando...")
+                return init_database()
+              return True
+              
+            except Exception as e:
+              print(f"Error verificando tabla: {str(e)}")
+              return False
+
           def handler(event, context):
-              try:
-                  body = json.loads(event.get('body', '{}'))
-              except json.JSONDecodeError:
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'Invalid JSON in request body'})
-                  }
+            try:
+              body = json.loads(event.get('body', '{}'))
+            except json.JSONDecodeError:
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'Invalid JSON in request body'})
+              }
+            
+            # Validaciones básicas
+            if not body.get('name'):
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'Product name is required'})
+              }
+            
+            # Asegurar que la tabla existe
+            if not ensure_table_exists():
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'No se pudo inicializar la base de datos'})
+              }
+            
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
               
-              # Validaciones básicas
-              if not body.get('name'):
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'Product name is required'})
-                  }
+              cursor = conn.cursor()
+              cursor.execute("""
+                INSERT INTO products (product_id, name, price, stock, description, created_at, updated_at)
+                VALUES (gen_random_uuid()::text, %s, %s, %s, %s, now(), now())
+                RETURNING product_id;
+              """, (
+                body.get('name'),
+                float(body.get('price', 0)) if body.get('price') is not None else 0.0,
+                int(body.get('stock', 0)),
+                body.get('description', '')
+              ))
               
-              try:
-                  conn = pg8000.connect(
-                      user=os.environ['DB_USER'],
-                      password=os.environ['DB_PASS'],
-                      host=os.environ['DB_HOST'],
-                      database=os.environ['DB_NAME'],
-                      port=5432
-                  )
-                  
-                  cursor = conn.cursor()
-                  cursor.execute("""
-                      INSERT INTO products (product_id, name, price, stock, description, created_at, updated_at)
-                      VALUES (gen_random_uuid()::text, %s, %s, %s, %s, now(), now())
-                      RETURNING product_id;
-                  """, (
-                      body.get('name'),
-                      float(body.get('price', 0)) if body.get('price') is not None else 0.0,
-                      int(body.get('stock', 0)),
-                      body.get('description', '')
-                  ))
-                  
-                  product_id = cursor.fetchone()[0]
-                  conn.commit()
-                  cursor.close()
-                  
-                  return {
-                      'statusCode': 201,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'product_id': product_id, 'message': 'Product created successfully'})
-                  }
-                  
-              except Exception as e:
-                  if 'conn' in locals():
-                      conn.rollback()
-                  return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': f'Database error: {str(e)}'})
-                  }
-              finally:
-                  if 'conn' in locals():
-                      conn.close()
+              product_id = cursor.fetchone()[0]
+              conn.commit()
+              cursor.close()
+              
+              return {
+                'statusCode': 201,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'product_id': product_id, 'message': 'Product created successfully'})
+              }
+              
+            except Exception as e:
+              if 'conn' in locals():
+                conn.rollback()
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': f'Database error: {str(e)}'})
+              }
+            finally:
+              if 'conn' in locals():
+                conn.close()
 
   # =====================
   # UPDATE PRODUCT LAMBDA
@@ -255,8 +265,12 @@ Resources:
       Runtime: python3.11
       Handler: index.handler
       Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DBHOST
@@ -272,113 +286,193 @@ Resources:
           import pg8000
           from decimal import Decimal
 
-          def handler(event, context):
-              product_id = event.get('pathParameters', {}).get('product_id')
+          def init_database():
+            """Inicializa la base de datos si no existe"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
               
-              if not product_id:
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'product_id is required'})
-                  }
+              cursor = conn.cursor()
               
-              try:
-                  body = json.loads(event.get('body', '{}'))
-              except json.JSONDecodeError:
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'Invalid JSON in request body'})
-                  }
+              sql_script = """
+              CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+              CREATE TABLE IF NOT EXISTS products (
+                  product_id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                  name VARCHAR(255) NOT NULL,
+                  price DECIMAL(10,2) DEFAULT 0,
+                  stock INTEGER DEFAULT 0,
+                  description TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+              INSERT INTO products (product_id, name, price, stock, description) VALUES
+              ('prod-001', 'Caña de Pescar Profesional', 89.99, 15, 'Caña de fibra de carbono de alta resistencia'),
+              ('prod-002', 'Carrete Spinning', 45.50, 20, 'Carrete de precisión con freno ajustable'),
+              ('prod-003', 'Señuelos Artificiales', 12.99, 50, 'Pack de 5 señuelos de diferentes colores')
+              ON CONFLICT (product_id) DO NOTHING;
+              """
               
-              if not body.get('name'):
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'Product name is required'})
-                  }
+              cursor.execute(sql_script)
+              conn.commit()
+              cursor.close()
+              conn.close()
+              return True
+              
+            except Exception as e:
+              print(f"Error en inicialización: {str(e)}")
+              return False
 
-              try:
-                  conn = pg8000.connect(
-                      user=os.environ['DB_USER'],
-                      password=os.environ['DB_PASS'],
-                      host=os.environ['DB_HOST'],
-                      database=os.environ['DB_NAME'],
-                      port=5432
-                  )
-                  
-                  cursor = conn.cursor()
-                  cursor.execute("""
-                      UPDATE products
-                      SET name=%s, price=%s, stock=%s, description=%s, updated_at=now()
-                      WHERE product_id=%s
-                      RETURNING product_id;
-                  """, (
-                      body.get('name'),
-                      float(body.get('price', 0)) if body.get('price') is not None else 0.0,
-                      int(body.get('stock', 0)),
-                      body.get('description', ''),
-                      product_id
-                  ))
-                  
-                  updated = cursor.fetchone()
-                  conn.commit()
-                  cursor.close()
-                  
-                  if not updated:
-                      return {
-                          'statusCode': 404,
-                          'headers': {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*',
-                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                              'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                          },
-                          'body': json.dumps({'error': 'Product not found'})
-                      }
-                  
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'product_id': updated[0], 'message': 'Product updated successfully'})
-                  }
-                  
-              except Exception as e:
-                  if 'conn' in locals():
-                      conn.rollback()
-                  return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': f'Database error: {str(e)}'})
-                  }
-              finally:
-                  if 'conn' in locals():
-                      conn.close()
+          def ensure_table_exists():
+            """Verifica si la tabla existe y la crea si no"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              cursor.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'products');")
+              table_exists = cursor.fetchone()[0]
+              cursor.close()
+              conn.close()
+              
+              if not table_exists:
+                print("Tabla no existe. Inicializando...")
+                return init_database()
+              return True
+              
+            except Exception as e:
+              print(f"Error verificando tabla: {str(e)}")
+              return False
+
+          def handler(event, context):
+            product_id = event.get('pathParameters', {}).get('product_id')
+            
+            if not product_id:
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'product_id is required'})
+              }
+            
+            try:
+              body = json.loads(event.get('body', '{}'))
+            except json.JSONDecodeError:
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'Invalid JSON in request body'})
+              }
+            
+            if not body.get('name'):
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'Product name is required'})
+              }
+
+            # Asegurar que la tabla existe
+            if not ensure_table_exists():
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'No se pudo inicializar la base de datos'})
+              }
+
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              cursor.execute("""
+                UPDATE products
+                SET name=%s, price=%s, stock=%s, description=%s, updated_at=now()
+                WHERE product_id=%s
+                RETURNING product_id;
+              """, (
+                body.get('name'),
+                float(body.get('price', 0)) if body.get('price') is not None else 0.0,
+                int(body.get('stock', 0)),
+                body.get('description', ''),
+                product_id
+              ))
+              
+              updated = cursor.fetchone()
+              conn.commit()
+              cursor.close()
+              
+              if not updated:
+                return {
+                  'statusCode': 404,
+                  'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps({'error': 'Product not found'})
+                }
+              
+              return {
+                'statusCode': 200,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'product_id': updated[0], 'message': 'Product updated successfully'})
+              }
+              
+            except Exception as e:
+              if 'conn' in locals():
+                conn.rollback()
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': f'Database error: {str(e)}'})
+              }
+            finally:
+              if 'conn' in locals():
+                conn.close()
 
   # =====================
   # DELETE PRODUCT LAMBDA
@@ -390,8 +484,12 @@ Resources:
       Runtime: python3.11
       Handler: index.handler
       Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DBHOST
@@ -406,78 +504,158 @@ Resources:
           import os
           import pg8000
 
-          def handler(event, context):
-              product_id = event.get('pathParameters', {}).get('product_id')
+          def init_database():
+            """Inicializa la base de datos si no existe"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
               
-              if not product_id:
-                  return {
-                      'statusCode': 400,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': 'product_id is required'})
-                  }
+              cursor = conn.cursor()
+              
+              sql_script = """
+              CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+              CREATE TABLE IF NOT EXISTS products (
+                  product_id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                  name VARCHAR(255) NOT NULL,
+                  price DECIMAL(10,2) DEFAULT 0,
+                  stock INTEGER DEFAULT 0,
+                  description TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+              INSERT INTO products (product_id, name, price, stock, description) VALUES
+              ('prod-001', 'Caña de Pescar Profesional', 89.99, 15, 'Caña de fibra de carbono de alta resistencia'),
+              ('prod-002', 'Carrete Spinning', 45.50, 20, 'Carrete de precisión con freno ajustable'),
+              ('prod-003', 'Señuelos Artificiales', 12.99, 50, 'Pack de 5 señuelos de diferentes colores')
+              ON CONFLICT (product_id) DO NOTHING;
+              """
+              
+              cursor.execute(sql_script)
+              conn.commit()
+              cursor.close()
+              conn.close()
+              return True
+              
+            except Exception as e:
+              print(f"Error en inicialización: {str(e)}")
+              return False
 
-              try:
-                  conn = pg8000.connect(
-                      user=os.environ['DB_USER'],
-                      password=os.environ['DB_PASS'],
-                      host=os.environ['DB_HOST'],
-                      database=os.environ['DB_NAME'],
-                      port=5432
-                  )
-                  
-                  cursor = conn.cursor()
-                  cursor.execute("DELETE FROM products WHERE product_id = %s RETURNING product_id", (product_id,))
-                  deleted = cursor.fetchone()
-                  conn.commit()
-                  cursor.close()
-                  
-                  if not deleted:
-                      return {
-                          'statusCode': 404,
-                          'headers': {
-                              'Content-Type': 'application/json',
-                              'Access-Control-Allow-Origin': '*',
-                              'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                              'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                          },
-                          'body': json.dumps({'error': 'Product not found'})
-                      }
-                  
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'product_id': deleted[0], 'message': 'Product deleted successfully'})
-                  }
-                  
-              except Exception as e:
-                  if 'conn' in locals():
-                      conn.rollback()
-                  return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': f'Database error: {str(e)}'})
-                  }
-              finally:
-                  if 'conn' in locals():
-                      conn.close()
+          def ensure_table_exists():
+            """Verifica si la tabla existe y la crea si no"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              cursor.execute("SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'products');")
+              table_exists = cursor.fetchone()[0]
+              cursor.close()
+              conn.close()
+              
+              if not table_exists:
+                print("Tabla no existe. Inicializando...")
+                return init_database()
+              return True
+              
+            except Exception as e:
+              print(f"Error verificando tabla: {str(e)}")
+              return False
+
+          def handler(event, context):
+            product_id = event.get('pathParameters', {}).get('product_id')
+            
+            if not product_id:
+              return {
+                'statusCode': 400,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'product_id is required'})
+              }
+
+            # Asegurar que la tabla existe
+            if not ensure_table_exists():
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': 'No se pudo inicializar la base de datos'})
+              }
+
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              cursor.execute("DELETE FROM products WHERE product_id = %s RETURNING product_id", (product_id,))
+              deleted = cursor.fetchone()
+              conn.commit()
+              cursor.close()
+              
+              if not deleted:
+                return {
+                  'statusCode': 404,
+                  'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps({'error': 'Product not found'})
+                }
+              
+              return {
+                'statusCode': 200,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'product_id': deleted[0], 'message': 'Product deleted successfully'})
+              }
+              
+            except Exception as e:
+              if 'conn' in locals():
+                conn.rollback()
+              return {
+                'statusCode': 500,
+                'headers': {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                },
+                'body': json.dumps({'error': f'Database error: {str(e)}'})
+              }
+            finally:
+              if 'conn' in locals():
+                conn.close()
 
   # ========================
-  # GET ALL PRODUCTS LAMBDA (MODIFICADA)
+  # GET ALL PRODUCTS LAMBDA
   # ========================
   GetAllProductsLambda:
     Type: AWS::Lambda::Function
@@ -486,15 +664,18 @@ Resources:
       Runtime: python3.11
       Handler: index.handler
       Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
           DB_HOST: !Ref DBHOST
           DB_NAME: !Ref DBNAME
           DB_USER: !Ref DBUSER
           DB_PASS: !Ref DBPASS
-          INIT_LAMBDA_ARN: !GetAtt InitDBLambda.Arn
       Layers:
         - !Ref Pg8000Layer
       Code:
@@ -504,136 +685,120 @@ Resources:
           import pg8000
           import datetime
           from decimal import Decimal
-          import boto3
+
+          def init_database():
+            """Inicializa la base de datos si no existe"""
+            try:
+              conn = pg8000.connect(
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASS'],
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                port=5432
+              )
+              
+              cursor = conn.cursor()
+              
+              # Script SQL completo
+              sql_script = """
+              -- Crear extensión para UUIDs
+              CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+              -- Crear tabla products
+              CREATE TABLE IF NOT EXISTS products (
+                  product_id VARCHAR(255) PRIMARY KEY DEFAULT gen_random_uuid()::text,
+                  name VARCHAR(255) NOT NULL,
+                  price DECIMAL(10,2) DEFAULT 0,
+                  stock INTEGER DEFAULT 0,
+                  description TEXT,
+                  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+
+              -- Insertar datos de prueba
+              INSERT INTO products (product_id, name, price, stock, description) VALUES
+              ('prod-001', 'Caña de Pescar Profesional', 89.99, 15, 'Caña de fibra de carbono de alta resistencia'),
+              ('prod-002', 'Carrete Spinning', 45.50, 20, 'Carrete de precisión con freno ajustable'),
+              ('prod-003', 'Señuelos Artificiales', 12.99, 50, 'Pack de 5 señuelos de diferentes colores')
+              ON CONFLICT (product_id) DO NOTHING;
+              """
+              
+              cursor.execute(sql_script)
+              conn.commit()
+              cursor.close()
+              conn.close()
+              return True
+              
+            except Exception as e:
+              print(f"Error en inicialización: {str(e)}")
+              return False
 
           def handler(event, context):
+            max_retries = 2
+            for attempt in range(max_retries):
               try:
-                  conn = pg8000.connect(
-                      user=os.environ['DB_USER'],
-                      password=os.environ['DB_PASS'],
-                      host=os.environ['DB_HOST'],
-                      database=os.environ['DB_NAME'],
-                      port=5432
-                  )
-                  
-                  cursor = conn.cursor()
-                  cursor.execute("SELECT * FROM products ORDER BY created_at DESC")
-                  rows = cursor.fetchall()
-                  cursor.close()
+                conn = pg8000.connect(
+                  user=os.environ['DB_USER'],
+                  password=os.environ['DB_PASS'],
+                  host=os.environ['DB_HOST'],
+                  database=os.environ['DB_NAME'],
+                  port=5432
+                )
+                
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM products ORDER BY created_at DESC")
+                rows = cursor.fetchall()
+                cursor.close()
 
-                  columns = ["product_id", "name", "price", "stock", "description", "created_at", "updated_at"]
+                columns = ["product_id", "name", "price", "stock", "description", "created_at", "updated_at"]
+                products = []
+                
+                for row in rows:
+                  product = dict(zip(columns, row))
+                  for key, value in product.items():
+                    if isinstance(value, Decimal):
+                      product[key] = float(value)
+                  for field in ['created_at', 'updated_at']:
+                    if product[field] and isinstance(product[field], (datetime.datetime, datetime.date)):
+                      product[field] = product[field].isoformat()
+                  products.append(product)
 
-                  products = []
-                  for row in rows:
-                      product = dict(zip(columns, row))
-                      
-                      # Convertir todos los tipos Decimal a float
-                      for key, value in product.items():
-                          if isinstance(value, Decimal):
-                              product[key] = float(value)
-                      
-                      # Convertir fechas a string ISO
-                      for field in ['created_at', 'updated_at']:
-                          if product[field] and isinstance(product[field], (datetime.datetime, datetime.date)):
-                              product[field] = product[field].isoformat()
-                      
-                      products.append(product)
-
-                  return {
-                      'statusCode': 200,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps(products, default=str)
-                  }
-                  
+                return {
+                  'statusCode': 200,
+                  'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps(products, default=str)
+                }
+                
               except Exception as e:
-                  error_msg = str(e)
-                  
-                  # Detectar si es error de tabla no existe
-                  if "relation \"products\" does not exist" in error_msg:
-                      print("Tabla no encontrada. Inicializando base de datos...")
-                      
-                      try:
-                          # Llamar a la lambda de inicialización
-                          lambda_client = boto3.client('lambda')
-                          response = lambda_client.invoke(
-                              FunctionName=os.environ['INIT_LAMBDA_ARN'],
-                              InvocationType='RequestResponse'
-                          )
-                          
-                          init_result = json.loads(response['Payload'].read())
-                          
-                          if init_result.get('statusCode') == 200:
-                              # Reintentar la consulta después de la inicialización
-                              conn = pg8000.connect(
-                                  user=os.environ['DB_USER'],
-                                  password=os.environ['DB_PASS'],
-                                  host=os.environ['DB_HOST'],
-                                  database=os.environ['DB_NAME'],
-                                  port=5432
-                              )
-                              
-                              cursor = conn.cursor()
-                              cursor.execute("SELECT * FROM products ORDER BY created_at DESC")
-                              rows = cursor.fetchall()
-                              cursor.close()
-
-                              columns = ["product_id", "name", "price", "stock", "description", "created_at", "updated_at"]
-                              products = []
-                              
-                              for row in rows:
-                                  product = dict(zip(columns, row))
-                                  for key, value in product.items():
-                                      if isinstance(value, Decimal):
-                                          product[key] = float(value)
-                                  for field in ['created_at', 'updated_at']:
-                                      if product[field] and isinstance(product[field], (datetime.datetime, datetime.date)):
-                                          product[field] = product[field].isoformat()
-                                  products.append(product)
-
-                              return {
-                                  'statusCode': 200,
-                                  'headers': {
-                                      'Content-Type': 'application/json',
-                                      'Access-Control-Allow-Origin': '*',
-                                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                                  },
-                                  'body': json.dumps(products, default=str)
-                              }
-                          else:
-                              return init_result
-                              
-                      except Exception as init_error:
-                          return {
-                              'statusCode': 500,
-                              'headers': {
-                                  'Content-Type': 'application/json',
-                                  'Access-Control-Allow-Origin': '*',
-                                  'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                                  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                              },
-                              'body': json.dumps({'error': f'Error durante inicialización: {str(init_error)}'})
-                          }
-                  
-                  # Si es otro error, devolver normalmente
-                  return {
-                      'statusCode': 500,
-                      'headers': {
-                          'Content-Type': 'application/json',
-                          'Access-Control-Allow-Origin': '*',
-                          'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
-                          'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
-                      },
-                      'body': json.dumps({'error': f'Database error: {error_msg}'})
-                  }
+                error_msg = str(e)
+                print(f"Intento {attempt + 1} fallido: {error_msg}")
+                
+                # Si es error de tabla no existe, inicializar
+                if "relation \"products\" does not exist" in error_msg and attempt == 0:
+                  print("Tabla no existe. Inicializando...")
+                  if init_database():
+                    print("Base de datos inicializada, reintentando consulta...")
+                    continue  # Reintentar la consulta
+                
+                # Si es otro error o el segundo intento falla
+                return {
+                  'statusCode': 500,
+                  'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key',
+                    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps({'error': f'Database error: {error_msg}'})
+                }
               finally:
-                  if 'conn' in locals():
-                      conn.close()
+                if 'conn' in locals():
+                  conn.close()
 
 Outputs:
   CreateProductLambdaArn:
@@ -652,6 +817,6 @@ Outputs:
     Description: ARN de la Lambda GetAll
     Value: !GetAtt GetAllProductsLambda.Arn
 
-  InitDBLambdaArn:
-    Description: ARN de la Lambda de Inicialización
-    Value: !GetAtt InitDBLambda.Arn
+  LambdaSecurityGroupId:
+    Description: ID del Security Group para Lambdas
+    Value: !Ref LambdaSecurityGroup
