@@ -54,7 +54,7 @@ Parameters:
 
 Resources:
   # ============================================================================
-  # VPC ENDPOINTS (Para acceso a servicios AWS sin internet)
+  # VPC ENDPOINTS 
   # ============================================================================
   EndPointSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -99,15 +99,6 @@ Resources:
       SubnetIds: !Ref SubnetIds
       SecurityGroupIds:
         - !Ref EndPointSecurityGroup
-
-  S3Endpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      VpcEndpointType: Gateway
-      VpcId: !Ref VpcId
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
-      RouteTableIds:
-        - !Ref RouteTableId
 
   # ============================================================================
   # SECURITY GROUPS
@@ -253,7 +244,6 @@ Resources:
       ParentId: !Ref ProductsResource
       PathPart: "{product_id}"
 
-  # Métodos CRUD (igual que antes)
   PostProductsMethod:
     Type: AWS::ApiGateway::Method
     Properties:

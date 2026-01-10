@@ -27,7 +27,6 @@ Parameters:
     Description: Subnets privadas para las Lambdas (mínimo 2)
 
 Resources:
-  # Security Group para las Lambdas - CORREGIDO
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -39,12 +38,8 @@ Resources:
           ToPort: 5432
           CidrIp: !Ref VpcCidr  
         - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: !Ref VpcCidr 
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
+          FromPort: 80
+          ToPort: 80
           CidrIp: 0.0.0.0/0
           Description: "Para CloudWatch Logs"
 
