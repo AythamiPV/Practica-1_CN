@@ -1,11 +1,16 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "ECS Fargate + API Gateway REST API con API Key para la app Pesca"
+Description: "ECS Fargate + API Gateway REST API (acoplada) para la app Pesca"
 
 Parameters:
   ImageName:
     Type: String
     Description: ECR Image Name
-    Default: fishing-store:latest
+    Default: fishing-store:latest  
+
+  VpcCidr:
+    Type: String
+    Description: CIDR range de la VPC
+    Default: "172.31.0.0/16"
 
   VpcId:
     Type: AWS::EC2::VPC::Id
@@ -14,6 +19,11 @@ Parameters:
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Al menos 2 subnets para ECS y NLB
+
+  RouteTableId:
+    Type: String
+    Description: Route Table ID para VPC Endpoints (Gateway)
+    Default: "rtb-0b808742b00cbcc13"  
 
   DBType:
     Type: String
@@ -43,22 +53,83 @@ Parameters:
     Description: Password DB (solo DBType=postgres)
 
 Resources:
+  # ============================================================================
+  # VPC ENDPOINTS (Para acceso a servicios AWS sin internet)
+  # ============================================================================
+  EndPointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group para VPC Endpoints
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
 
+  EcrApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.api"
+      VpcId: !Ref VpcId
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref EndPointSecurityGroup
+
+  EcrDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.ecr.dkr"
+      VpcId: !Ref VpcId
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref EndPointSecurityGroup
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcId: !Ref VpcId
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref EndPointSecurityGroup
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref VpcId
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      RouteTableIds:
+        - !Ref RouteTableId
+
+  # ============================================================================
+  # SECURITY GROUPS
+  # ============================================================================
   ECSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Security group para ECS tasks Pesca
+      GroupDescription: Security group para ECS tasks Pesca Acoplada
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
           FromPort: 8080
           ToPort: 8080
-          CidrIp: 0.0.0.0/0
+          CidrIp: !Ref VpcCidr
 
+  # ============================================================================
+  # LOAD BALANCER
+  # ============================================================================
   NLB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: pesca-nlb
+      Name: pesca-nlb-acoplada
       Type: network
       Scheme: internal
       Subnets: !Ref SubnetIds
@@ -66,7 +137,7 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
-      Name: pesca-tg
+      Name: pesca-tg-acoplada
       Port: 8080
       Protocol: TCP
       VpcId: !Ref VpcId
@@ -84,15 +155,18 @@ Resources:
       Port: 8080
       Protocol: TCP
 
+  # ============================================================================
+  # ECS
+  # ============================================================================
   ECSCluster:
     Type: AWS::ECS::Cluster
     Properties:
-      ClusterName: pesca-cluster
+      ClusterName: pesca-cluster-acoplada
 
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: pesca-task
+      Family: pesca-task-acoplada
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
@@ -101,7 +175,7 @@ Resources:
       ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
       TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/LabRole"
       ContainerDefinitions:
-        - Name: pesca-container
+        - Name: pesca-container-acoplada
           Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ImageName}"
           PortMappings:
             - ContainerPort: 8080
@@ -109,9 +183,9 @@ Resources:
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: /ecs/pesca
+              awslogs-group: /ecs/pesca-acoplada
               awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: pesca
+              awslogs-stream-prefix: pesca-acoplada
               awslogs-create-group: "true"
           Environment:
             - Name: DB_TYPE
@@ -129,35 +203,41 @@ Resources:
     Type: AWS::ECS::Service
     DependsOn:
       - Listener
+      - EcrApiEndpoint
+      - EcrDkrEndpoint
+      - CloudWatchLogsEndpoint
     Properties:
       Cluster: !Ref ECSCluster
-      ServiceName: pesca-service
+      ServiceName: pesca-service-acoplada
       TaskDefinition: !Ref TaskDefinition
       DesiredCount: 1
       LaunchType: FARGATE
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED  # ¡Ahora funciona con VPC Endpoints!
           Subnets: !Ref SubnetIds
           SecurityGroups:
             - !Ref ECSSecurityGroup
       LoadBalancers:
-        - ContainerName: pesca-container
+        - ContainerName: pesca-container-acoplada
           ContainerPort: 8080
           TargetGroupArn: !Ref TargetGroup
 
+  # ============================================================================
+  # API GATEWAY
+  # ============================================================================
   VPCLink:
     Type: AWS::ApiGateway::VpcLink
     Properties:
-      Name: pesca-vpc-link
+      Name: pesca-vpc-link-acoplada
       TargetArns:
         - !Ref NLB
 
   RestAPI:
     Type: AWS::ApiGateway::RestApi
     Properties:
-      Name: pesca-api
-      Description: API Gateway para la aplicación Pesca
+      Name: pesca-api-acoplada
+      Description: API Gateway para la aplicación Pesca (acoplada con ECS)
 
   ProductsResource:
     Type: AWS::ApiGateway::Resource
@@ -173,6 +253,7 @@ Resources:
       ParentId: !Ref ProductsResource
       PathPart: "{product_id}"
 
+  # Métodos CRUD (igual que antes)
   PostProductsMethod:
     Type: AWS::ApiGateway::Method
     Properties:
@@ -337,14 +418,14 @@ Resources:
   APIKey:
     Type: AWS::ApiGateway::ApiKey
     Properties:
-      Name: pesca-api-key
+      Name: pesca-api-key-acoplada
       Enabled: true
 
   UsagePlan:
     Type: AWS::ApiGateway::UsagePlan
     DependsOn: APIStage
     Properties:
-      UsagePlanName: pesca-usage-plan
+      UsagePlanName: pesca-usage-plan-acoplada
       ApiStages:
         - ApiId: !Ref RestAPI
           Stage: !Ref APIStage

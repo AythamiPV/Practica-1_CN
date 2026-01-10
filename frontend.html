@@ -303,34 +303,6 @@
         console.error('API Request failed:', error);
         throw error;
       }
-    }   
-      const options = {
-        method,
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': API_KEY
-        }
-      };
-      if (body) {
-        options.body = JSON.stringify(body);
-      }
-
-      const response = await fetch(`${API_URL}${endpoint}`, options);
-
-      if (!response.ok) {
-        let errorText;
-        try {
-          const errorJson = await response.json();
-          errorText = errorJson.error || JSON.stringify(errorJson);
-        } catch {
-          errorText = response.statusText || 'Error desconocido';
-        }
-        throw new Error(errorText);
-      }
-
-      if (method === 'DELETE') return null;
-
-      return await response.json();
     }
 
     async function loadProducts() {

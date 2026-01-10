@@ -61,7 +61,7 @@ Resources:
         Type: AWS_PROXY
         IntegrationHttpMethod: POST
         Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAllProductsLambdaArn}/invocations
-      MethodResponses: [] 
+      MethodResponses: [] # Vacío, porque es proxy integration
 
   PostProductsMethod:
     Type: AWS::ApiGateway::Method
@@ -275,5 +275,4 @@ Outputs:
 
   APIKeyValue:
     Description: Valor de la API Key para uso en cliente
-
     Value: !Ref APIKey

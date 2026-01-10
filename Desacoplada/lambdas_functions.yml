@@ -18,13 +18,16 @@ Parameters:
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: VPC donde desplegar las Lambdas
+  VpcCidr:
+    Type: String
+    Description: CIDR de la VPC
+    Default: "172.31.0.0/16"
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
     Description: Subnets privadas para las Lambdas (mínimo 2)
 
 Resources:
-
-  # Security Group para las Lambdas
+  # Security Group para las Lambdas - CORREGIDO
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -34,11 +37,16 @@ Resources:
         - IpProtocol: tcp
           FromPort: 5432
           ToPort: 5432
-          CidrIp: 0.0.0.0/0  # Para conectar a RDS
+          CidrIp: !Ref VpcCidr  
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
-          CidrIp: 0.0.0.0/0  # Para salida a internet (CloudWatch Logs, etc.)
+          CidrIp: !Ref VpcCidr 
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: "Para CloudWatch Logs"
 
   Pg8000Layer:
     Type: AWS::Lambda::LayerVersion
